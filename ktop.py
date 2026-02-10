@@ -72,7 +72,7 @@ _t("Everforest",        "#d699b6",       "#7fbbb3",      "#a7c080",      "#a7c08
 _t("Kanagawa",          "#957fb8",       "#7e9cd8",      "#98bb6c",      "#98bb6c",      "#7e9cd8",      "#98bb6c",  "#e6c384",  "#c34043")
 
 # ── Monochrome / minimal ──
-_t("Monochrome",        "white",         "white",        "white",        "white",        "white",        "bright_white","white",  "dim white")
+_t("Monochrome",        "white",         "white",        "white",        "white",        "white",        "bright_white","white",  "#888888")
 _t("Green Screen",      "green",         "green",        "green",        "green",        "green",        "bright_green","green",  "dark_green")
 _t("Amber",             "#ffbf00",       "#ffbf00",      "#ffbf00",      "#ffbf00",      "#ffbf00",      "#ffd700",  "#ffbf00",  "#ff8c00")
 _t("Phosphor",          "#33ff00",       "#33ff00",      "#33ff00",      "#33ff00",      "#33ff00",      "#66ff33",  "#33ff00",  "#009900")
