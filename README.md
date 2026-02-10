@@ -17,7 +17,7 @@ A terminal-based system resource monitor built for tracking resource usage when 
 
 ## Screenshot
 
-![ktop screenshot](screenshot.png)
+![ktop screenshot](screenshot.png?v=2)
 
 ## Quick Install
 
