@@ -82,5 +82,7 @@ if [ "$NEED_SUDO" = false ]; then
 fi
 
 echo "==> Done! Launching ktop..."
-echo "    Next time just run: ktop (open a new terminal if not found)"
-exec "$INSTALL_PATH" "$@"
+"$INSTALL_PATH" "$@"
+echo ""
+echo "    To run ktop again, open a new terminal and type: ktop"
+echo "    (restart your terminal session for PATH changes to take effect)"
