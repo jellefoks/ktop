@@ -14,7 +14,7 @@ A terminal-based system resource monitor built for tracking resource usage when 
 - **Memory Monitoring** — RAM and swap usage with gradient progress bars
 - **Temperature Strip** — CPU, memory, and per-GPU temps with mini bar charts and hardware-accurate thresholds
 - **OOM Kill Tracker** — Status bar shows the most recent OOM kill from the last 8 hours
-- **Process Tables** — Top 10 processes by memory (Used/Shared) and CPU usage, updated in real-time
+- **Process Tables** — Top 10 processes by memory (Used/Shared) and CPU usage (Core % + system-wide CPU %)
 - **50 Color Themes** — Press `t` to browse and switch themes with live preview; persists across sessions
 - **Gradient Bar Charts** — Smooth per-block color gradients from low to high across all bars
 - **Responsive UI** — 50ms input polling for snappy keyboard navigation

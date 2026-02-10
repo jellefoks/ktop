@@ -1,13 +1,26 @@
 # Changelog
 
+## 0.8.0 — 2026-02-10
+
+- CPU process table now shows both Core % (per-core, matches `top`) and CPU % (system-wide)
+- Fixed per-process CPU calculation: no longer divides by num_cpus
+- Raw binary I/O for `/proc` reads: `os.open`/`os.read`/`os.close` instead of Python file objects
+- Binary mode (`rb`) and `split(None, 22)` to avoid decoding overhead and unnecessary allocations
+- CPU frequency read from sysfs (`scaling_cur_freq`) instead of `psutil.cpu_freq()` (9ms → 0.02ms), with psutil fallback
+- Deferred `/proc/pid/statm` reads: only read for the top 20 displayed processes instead of all ~1690
+- `cpu_count` cached at init; `cpu_freq` polled every 5s
+- Process CPU baselines seeded at startup for accurate first-frame deltas
+- Process tables populate after 1s, refresh every 3s
+- Total frame time: 228ms → 20ms (11x improvement)
+- Tested: profiled with `--sim`, reinstalled via setup.sh
+
 ## 0.7.0 — 2026-02-10
 
 - Process scanning optimized: replaced `psutil.process_iter` with direct `/proc/pid/stat` + `/proc/pid/statm` reads (214ms → 23ms per scan, ~9x faster)
 - Process list cached for 5 seconds instead of rescanning every frame
 - Added `--sim` flag for simulation mode (fake OOM kills, profiling output to `/tmp/ktop_profile.log`)
 - Profiler logs avg/max/calls per section every 5s in sim mode
-- Total frame time reduced from ~228ms to ~56ms (~4x improvement)
-- OOM kill tracker now uses `journalctl` for persistent 8-hour lookback instead of `dmesg` kernel ring buffer
+- OOM kill tracker uses `journalctl` for persistent 8-hour lookback instead of `dmesg` kernel ring buffer
 - OOM status shows solid block `█` when OOM detected, hollow `░` when clear
 - Tested: profiled with `--sim`, reinstalled via setup.sh
 
