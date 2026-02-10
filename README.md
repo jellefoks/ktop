@@ -35,28 +35,30 @@ A terminal-based system resource monitor built for tracking resource usage when 
 ╰───────────────────────────╯╰───────────────────────────╯
 ```
 
-## Install
+## Quick Install
 
 ```bash
 git clone https://github.com/aemiguel/ktop.git
 cd ktop
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+./setup.sh
+```
+
+This creates a virtual environment, installs dependencies, and adds `ktop` to `~/.local/bin` so you can run it from anywhere.
+
+For a system-wide install (requires sudo):
+
+```bash
+./setup.sh --system
 ```
 
 ## Usage
 
 ```bash
 # Run with defaults (1s refresh)
-python ktop.py
+ktop
 
 # Custom refresh rate
-python ktop.py -r 2
-
-# Or make it executable
-chmod +x ktop.py
-./ktop.py
+ktop -r 2
 ```
 
 Press `Ctrl+C` to exit.

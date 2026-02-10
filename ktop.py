@@ -16,15 +16,19 @@ from rich.table import Table
 from rich.text import Text
 
 try:
-    from pynvml import (  # noqa: F401 – works with both pynvml and nvidia-ml-py
-        nvmlDeviceGetCount,
-        nvmlDeviceGetHandleByIndex,
-        nvmlDeviceGetMemoryInfo,
-        nvmlDeviceGetName,
-        nvmlDeviceGetUtilizationRates,
-        nvmlInit,
-        nvmlShutdown,
-    )
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        from pynvml import (
+            nvmlDeviceGetCount,
+            nvmlDeviceGetHandleByIndex,
+            nvmlDeviceGetMemoryInfo,
+            nvmlDeviceGetName,
+            nvmlDeviceGetUtilizationRates,
+            nvmlInit,
+            nvmlShutdown,
+        )
 
     _PYNVML = True
 except ImportError:

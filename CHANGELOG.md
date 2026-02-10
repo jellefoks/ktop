@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1 — 2026-02-10
+
+- Added `setup.sh` installer script — installs `ktop` as a command to `~/.local/bin` (or `/usr/local/bin` with `--system`)
+- Suppressed pynvml FutureWarning deprecation noise
+- Updated README with quick-install instructions
+- Tested: `ktop` command works system-wide after `./setup.sh`
+
 ## 0.1.0 — 2026-02-10
 
 - Initial release of ktop
