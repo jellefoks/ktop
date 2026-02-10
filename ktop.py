@@ -5,13 +5,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
+import re
 import select
 import signal
+import subprocess
 import sys
 import termios
 import time
 import tty
 from collections import deque
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import psutil
@@ -29,10 +33,14 @@ try:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
         from pynvml import (
+            NVML_TEMPERATURE_GPU,
+            NVML_TEMPERATURE_THRESHOLD_SLOWDOWN,
             nvmlDeviceGetCount,
             nvmlDeviceGetHandleByIndex,
             nvmlDeviceGetMemoryInfo,
             nvmlDeviceGetName,
+            nvmlDeviceGetTemperature,
+            nvmlDeviceGetTemperatureThreshold,
             nvmlDeviceGetUtilizationRates,
             nvmlInit,
             nvmlShutdown,
@@ -44,6 +52,7 @@ except ImportError:
 
 # ── constants ────────────────────────────────────────────────────────────────
 SPARK = " ▁▂▃▄▅▆▇█"
+SPARK_DOWN = " ▔\U0001FB82\U0001FB83▀\U0001FB84\U0001FB85\U0001FB86█"
 HISTORY_LEN = 300
 CONFIG_DIR = Path.home() / ".config" / "ktop"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -53,8 +62,8 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 THEMES: dict[str, dict] = {}
 
 
-def _t(name, gpu, cpu, mem, pm, pc, lo, mid, hi, net=None):
-    THEMES[name] = dict(gpu=gpu, cpu=cpu, mem=mem, proc_mem=pm, proc_cpu=pc, bar_low=lo, bar_mid=mid, bar_high=hi, net=net or cpu)
+def _t(name, gpu, cpu, mem, pm, pc, lo, mid, hi, net=None, net_up=None, net_down=None):
+    THEMES[name] = dict(gpu=gpu, cpu=cpu, mem=mem, proc_mem=pm, proc_cpu=pc, bar_low=lo, bar_mid=mid, bar_high=hi, net=net or cpu, net_up=net_up or gpu, net_down=net_down or (net or cpu))
 
 
 # ── Classic & editor themes ──
@@ -200,6 +209,21 @@ def _sparkline(values, width: int | None = None) -> str:
     return "".join(out)
 
 
+def _sparkline_down(values, width: int | None = None) -> str:
+    """Sparkline with blocks extending downward from the top."""
+    if not values:
+        return ""
+    vals = list(values)
+    if width and len(vals) > width:
+        vals = vals[-width:]
+    out = []
+    for v in vals:
+        v = max(0.0, min(100.0, v))
+        idx = int(v / 100 * (len(SPARK_DOWN) - 1))
+        out.append(SPARK_DOWN[idx])
+    return "".join(out)
+
+
 def _fmt_bytes(b: float) -> str:
     mb = b / 1024**2
     if mb >= 1000:
@@ -250,8 +274,9 @@ def _read_key() -> str | None:
 
 # ── main monitor ─────────────────────────────────────────────────────────────
 class KTop:
-    def __init__(self, refresh: float = 1.0):
+    def __init__(self, refresh: float = 1.0, sim: bool = False):
         self.refresh = refresh
+        self.sim = sim
         self.console = Console()
 
         # theme
@@ -296,6 +321,10 @@ class KTop:
             except Exception:
                 pass
 
+        # OOM kill tracking
+        self._last_oom_check = 0.0
+        self._last_oom_str: str | None = None
+
         psutil.cpu_percent(interval=None)
 
     # ── data collectors ──────────────────────────────────────────────────
@@ -321,6 +350,46 @@ class KTop:
         self.net_up_hist.append(up)
         self.net_down_hist.append(down)
         return up, down
+
+    def _sample_temps(self) -> dict:
+        """Collect temperature readings with hardware limits."""
+        temps = {"cpu": None, "cpu_max": 100.0, "mem": None, "mem_max": 85.0, "gpus": []}
+        # CPU and memory temps from psutil (includes high/critical thresholds)
+        try:
+            sensor_temps = psutil.sensors_temperatures()
+            for key in ("coretemp", "k10temp", "cpu_thermal", "zenpower", "acpitz"):
+                if key in sensor_temps:
+                    for s in sensor_temps[key]:
+                        if temps["cpu"] is None or s.current > temps["cpu"]:
+                            temps["cpu"] = s.current
+                        # Use reported critical/high as the max
+                        if s.critical and s.critical > temps["cpu_max"]:
+                            temps["cpu_max"] = s.critical
+                        elif s.high and s.high > temps["cpu_max"]:
+                            temps["cpu_max"] = s.high
+            for key in ("SODIMM", "dimm", "memory"):
+                if key in sensor_temps:
+                    for s in sensor_temps[key]:
+                        if temps["mem"] is None or s.current > temps["mem"]:
+                            temps["mem"] = s.current
+                        if s.critical:
+                            temps["mem_max"] = s.critical
+        except (AttributeError, Exception):
+            pass
+        # GPU temps + slowdown threshold from pynvml
+        if self.gpu_ok:
+            for i in range(self.gpu_count):
+                try:
+                    h = nvmlDeviceGetHandleByIndex(i)
+                    t = nvmlDeviceGetTemperature(h, NVML_TEMPERATURE_GPU)
+                    try:
+                        t_max = nvmlDeviceGetTemperatureThreshold(h, NVML_TEMPERATURE_THRESHOLD_SLOWDOWN)
+                    except Exception:
+                        t_max = 95
+                    temps["gpus"].append({"temp": t, "max": t_max})
+                except Exception:
+                    temps["gpus"].append(None)
+        return temps
 
     def _gpu_info(self) -> list[dict]:
         gpus = []
@@ -364,6 +433,43 @@ class KTop:
         procs.sort(key=lambda x: x.get(key, 0) or 0, reverse=True)
         return procs[:n]
 
+    _SIM_PROCS = ["python3", "node", "java", "ollama", "vllm", "ffmpeg", "cc1plus", "rustc", "chrome", "mysqld"]
+
+    def _check_oom(self) -> str | None:
+        """Return most recent OOM kill in last 8h via journalctl, cached for 5s."""
+        now = time.monotonic()
+        if now - self._last_oom_check < 5.0:
+            return self._last_oom_str
+        self._last_oom_check = now
+        if self.sim:
+            if random.random() < 0.5:
+                self._last_oom_str = None
+            else:
+                fake_time = datetime.now() - timedelta(seconds=random.randint(0, 8 * 3600))
+                proc = random.choice(self._SIM_PROCS)
+                self._last_oom_str = f"{fake_time.strftime('%b %d %H:%M:%S')} {proc}"
+            return self._last_oom_str
+        try:
+            result = subprocess.run(
+                ["journalctl", "-k", "--since", "8 hours ago",
+                 "--no-pager", "-o", "short", "--grep", "Killed process"],
+                capture_output=True, text=True, timeout=3,
+                stderr=subprocess.DEVNULL,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                self._last_oom_str = None
+                return None
+            last_oom = result.stdout.strip().splitlines()[-1]
+            # Format: "Feb 10 14:23:01 host kernel: ... Killed process 1234 (name) ..."
+            ts_match = re.match(r"^(\w+ \d+ \d+:\d+:\d+)", last_oom)
+            proc_match = re.search(r"Killed process \d+ \(([^)]+)\)", last_oom)
+            ts = ts_match.group(1) if ts_match else "?"
+            proc = proc_match.group(1) if proc_match else "?"
+            self._last_oom_str = f"{ts} {proc}"
+        except Exception:
+            self._last_oom_str = None
+        return self._last_oom_str
+
     # ── panel builders ───────────────────────────────────────────────────
     def _gpu_panels(self) -> Layout:
         t = self.theme
@@ -376,8 +482,11 @@ class KTop:
             )
 
         gpu_layout = Layout()
-        # Panel inner width: total / num_gpus, minus border(2) + padding(2) + indent(5) + margin(4)
-        spark_w = max(10, self.console.width // max(len(gpus), 1) - 13)
+        # Panel inner width: total / num_gpus, minus border(2) + padding(2) + safety(2)
+        panel_w = max(20, self.console.width // max(len(gpus), 1) - 6)
+        # "Util " / "Mem  " = 5 chars, " XX.X%" = 7 chars
+        bar_w = max(5, panel_w - 5 - 7)
+        spark_w = max(10, panel_w - 5)
         children = []
         for g in gpus:
             uc = _color_for(g["util"], t)
@@ -385,10 +494,10 @@ class KTop:
             spark_u = _sparkline(self.gpu_util_hist[g["id"]], width=spark_w)
             spark_m = _sparkline(self.gpu_mem_hist[g["id"]], width=spark_w)
             body = (
-                f"[bold]Util[/bold] {_bar(g['util'], 15, t)} [{uc}]{g['util']:5.1f}%[/{uc}]\n"
+                f"[bold]Util[/bold] {_bar(g['util'], bar_w, t)} [{uc}]{g['util']:5.1f}%[/{uc}]\n"
                 f"     [{uc}]{spark_u}[/{uc}]\n"
                 f"\n"
-                f"[bold]Mem [/bold] {_bar(g['mem_pct'], 15, t)} [{mc}]{g['mem_pct']:5.1f}%[/{mc}]\n"
+                f"[bold]Mem [/bold] {_bar(g['mem_pct'], bar_w, t)} [{mc}]{g['mem_pct']:5.1f}%[/{mc}]\n"
                 f"     {g['mem_used_gb']:.1f}/{g['mem_total_gb']:.1f} GB\n"
                 f"     [{mc}]{spark_m}[/{mc}]"
             )
@@ -447,20 +556,21 @@ class KTop:
             [min(100.0, v / mx * 100) if mx else 0 for v in self.net_up_hist],
             width=spark_w,
         )
-        spark_dn = _sparkline(
+        spark_dn = _sparkline_down(
             [min(100.0, v / mx * 100) if mx else 0 for v in self.net_down_hist],
             width=spark_w,
         )
 
         nc = t["net"]
+        uc = t["net_up"]
+        dc = t["net_down"]
         body = (
-            f"[bold]Up  [/bold] {_bar(up_pct, bar_w, t)} [{nc}]{_fmt_speed(up):>10}[/{nc}]\n"
+            f"[bold]Up  [/bold] {_bar(up_pct, bar_w, t)} [{uc}]{_fmt_speed(up):>10}[/{uc}]\n"
             f"\n"
-            f"     [{nc}]{spark_up}[/{nc}]\n"
+            f"     [{uc}]{spark_up}[/{uc}]\n"
+            f"     [{dc}]{spark_dn}[/{dc}]\n"
             f"\n"
-            f"[bold]Down[/bold] {_bar(down_pct, bar_w, t)} [{nc}]{_fmt_speed(down):>10}[/{nc}]\n"
-            f"\n"
-            f"     [{nc}]{spark_dn}[/{nc}]\n"
+            f"[bold]Down[/bold] {_bar(down_pct, bar_w, t)} [{dc}]{_fmt_speed(down):>10}[/{dc}]\n"
             f"\n"
             f"[dim]Peak: {_fmt_speed(mx)}[/dim]"
         )
@@ -532,16 +642,78 @@ class KTop:
 
         return Panel(table, title=f"[bold {colour}] {title} [/bold {colour}]", border_style=colour)
 
-    def _status_bar(self) -> Text:
+    def _status_bar(self) -> Table:
         t = self.theme
-        bar = Text()
-        bar.append(" q", style=f"bold {t['cpu']}")
-        bar.append("/", style="dim")
-        bar.append("ESC", style=f"bold {t['cpu']}")
-        bar.append(" Quit  ", style="dim")
-        bar.append(" t", style=f"bold {t['gpu']}")
-        bar.append(f" Theme ({self.theme_name})  ", style="dim")
+        left = Text()
+        left.append(" q", style=f"bold {t['cpu']}")
+        left.append("/", style="dim")
+        left.append("ESC", style=f"bold {t['cpu']}")
+        left.append(" Quit  ", style="dim")
+        left.append(" t", style=f"bold {t['gpu']}")
+        left.append(f" Theme ({self.theme_name})  ", style="dim")
+
+        right = Text()
+        oom = self._check_oom()
+        if oom:
+            right.append("█ ", style=t["bar_high"])
+            right.append("OOM Kill: ", style=f"bold {t['bar_high']}")
+            right.append(oom + " ", style=t["bar_high"])
+        else:
+            right.append("░ ", style="dim")
+            right.append("No OOM kills ", style="dim")
+
+        bar = Table(box=None, pad_edge=False, show_header=False, expand=True)
+        bar.add_column(ratio=1)
+        bar.add_column(justify="right")
+        bar.add_row(left, right)
         return bar
+
+    def _temp_strip(self) -> Panel:
+        """Temperature strip with mini bar charts, evenly spaced."""
+        temps = self._sample_temps()
+        t = self.theme
+
+        def _temp_cell(label: str, temp_c: float | None, max_c: float = 100.0) -> Text:
+            cell = Text()
+            cell.append(f"{label} ", style="bold dim")
+            if temp_c is None:
+                cell.append("N/A", style="dim")
+                return cell
+            pct = min(100.0, temp_c / max_c * 100)
+            ratio = temp_c / max_c
+            if ratio < 0.6:
+                c = t["bar_low"]
+            elif ratio < 0.85:
+                c = t["bar_mid"]
+            else:
+                c = t["bar_high"]
+            filled = int(pct / 100 * 8)
+            cell.append("█" * filled, style=c)
+            cell.append("░" * (8 - filled), style="dim")
+            cell.append(f" {temp_c:.0f}/{max_c:.0f}°C", style=c)
+            return cell
+
+        # Collect all temp cells
+        cells = []
+        if temps["cpu"] is not None:
+            cells.append(_temp_cell("CPU", temps["cpu"], temps["cpu_max"]))
+        if temps["mem"] is not None:
+            cells.append(_temp_cell("MEM", temps["mem"], temps["mem_max"]))
+        for i, gpu_t in enumerate(temps["gpus"]):
+            if gpu_t is not None:
+                cells.append(_temp_cell(f"GPU{i}", gpu_t["temp"], gpu_t["max"]))
+            else:
+                cells.append(_temp_cell(f"GPU{i}", None))
+
+        # Build table with equal-width columns
+        table = Table(expand=True, box=None, pad_edge=True, show_header=False)
+        for _ in cells:
+            table.add_column(ratio=1)
+        if cells:
+            table.add_row(*cells)
+
+        tc = t["bar_mid"]
+        return Panel(table, title=f"[bold {tc}] Temps [/bold {tc}]", border_style=tc, height=3)
 
     # ── theme picker ─────────────────────────────────────────────────────
     def _theme_picker(self) -> Layout:
@@ -586,7 +758,8 @@ class KTop:
                     swatch = Text()
                     swatch.append("  ", style=f"on {th['gpu']}")
                     swatch.append(" ")
-                    swatch.append("  ", style=f"on {th['net']}")
+                    swatch.append("  ", style=f"on {th['net_up']}")
+                    swatch.append("  ", style=f"on {th['net_down']}")
                     swatch.append(" ")
                     swatch.append("  ", style=f"on {th['cpu']}")
                     swatch.append(" ")
@@ -650,6 +823,7 @@ class KTop:
         layout.split_column(
             Layout(name="gpu", ratio=2),
             Layout(name="mid", ratio=2),
+            Layout(name="temps", size=3),
             Layout(name="bot", ratio=3),
             Layout(name="status", size=1),
         )
@@ -669,6 +843,7 @@ class KTop:
         layout["mem"].update(self._mem_panel())
         layout["mem_procs"].update(self._proc_table("memory_percent"))
         layout["cpu_procs"].update(self._proc_table("cpu_percent"))
+        layout["temps"].update(self._temp_strip())
         layout["status"].update(self._status_bar())
 
         return layout
@@ -761,9 +936,13 @@ def main():
         "--theme", type=str, default=None,
         help=f"Color theme (see theme picker with 't' key)",
     )
+    parser.add_argument(
+        "--sim", action="store_true",
+        help="Simulation mode (fake OOM kills for testing)",
+    )
     args = parser.parse_args()
 
-    k = KTop(refresh=args.refresh)
+    k = KTop(refresh=args.refresh, sim=args.sim)
     if args.theme and args.theme in THEMES:
         k.theme_name = args.theme
         k.theme = THEMES[args.theme]

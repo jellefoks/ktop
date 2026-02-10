@@ -1,6 +1,6 @@
 # ktop
 
-![ktop screenshot](screenshot.png?v=2)
+![ktop screenshot](screenshot.png?v=3)
 
 A terminal-based system resource monitor built for tracking resource usage when running hybrid LLM workloads.
 
@@ -9,9 +9,11 @@ A terminal-based system resource monitor built for tracking resource usage when 
 ## Features
 
 - **GPU Monitoring** — Per-GPU utilization and memory usage with color-coded sparkline history (NVIDIA)
-- **Network Monitoring** — Upload and download speeds with auto-scaling bar charts and sparklines
+- **Network Monitoring** — Upload/download speeds with separate colored sparklines (upload extends up, download extends down)
 - **CPU Monitoring** — Overall CPU usage with gradient bar chart and sparkline history
 - **Memory Monitoring** — RAM and swap usage with gradient progress bars
+- **Temperature Strip** — CPU, memory, and per-GPU temps with mini bar charts and hardware-accurate thresholds
+- **OOM Kill Tracker** — Status bar shows the most recent OOM kill from the last 8 hours
 - **Process Tables** — Top 10 processes by memory (Used/Shared) and CPU usage, updated in real-time
 - **50 Color Themes** — Press `t` to browse and switch themes with live preview; persists across sessions
 - **Gradient Bar Charts** — Smooth per-block color gradients from low to high across all bars

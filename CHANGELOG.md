@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.0 — 2026-02-10
+
+- Network panel: sparklines now centered between bar charts — upload sparkline extends upward, download sparkline extends downward using upper-block Unicode characters
+- Added `SPARK_DOWN` character set and `_sparkline_down()` for top-down sparklines
+- Network upload and download now have separate theme colors (`net_up` defaults to GPU color, `net_down` defaults to net color)
+- Theme picker swatches updated to show net_up/net_down colors
+- Status bar now shows most recent OOM kill (process name + timestamp) on the right side, checked every 5 seconds via dmesg
+- Temperature strip border now uses theme `bar_mid` color instead of grey
+- Temperature strip with evenly-spaced entries using Table columns
+- GPU bar charts now use dynamic width matching CPU/memory panel sizing
+- Hardware-accurate temperature thresholds (GPU slowdown limit from NVML, CPU critical from psutil, 85°C JEDEC default for memory)
+- Tested: reinstalled via setup.sh
+
 ## 0.5.0 — 2026-02-10
 
 - Added Network panel to the second row (layout is now Network, CPU, Memory)
