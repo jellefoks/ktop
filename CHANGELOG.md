@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.0 — 2026-02-11
+
+- **AMD GPU support** via Linux sysfs — no new dependencies required
+- AMD GPUs detected automatically from `/sys/class/drm/card*/device/vendor` (vendor `0x1002`)
+- GPU utilization from `gpu_busy_percent`, VRAM from `mem_info_vram_total`/`mem_info_vram_used`
+- AMD GPU temperatures from hwmon `temp1_input`/`temp1_crit`
+- Mixed NVIDIA+AMD systems show all GPUs together with unified numbering
+- Gracefully handles missing sysfs files (older cards, APUs): util→0%, VRAM→0/0 GB, temp→N/A
+- GPU name from `product_name` with fallback to PCI device ID
+- Strips "AMD " and "Advanced Micro Devices, Inc. " prefixes in GPU panel subtitles
+- NVIDIA-only path unchanged — refactored `gpu_ok` → `nvidia_ok` for vendor-specific guards
+- Tested: verified no regression on NVIDIA-only system, ran `ktop --sim`, reinstalled via setup.sh
+
 ## 0.8.1 — 2026-02-11
 
 - OOM tracker now detects `systemd-oomd` kills in addition to kernel OOM kills

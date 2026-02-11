@@ -8,7 +8,7 @@ A terminal-based system resource monitor built for tracking resource usage when 
 
 ## Features
 
-- **GPU Monitoring** — Per-GPU utilization and memory usage with color-coded sparkline history (NVIDIA)
+- **GPU Monitoring** — Per-GPU utilization and memory usage with color-coded sparkline history (NVIDIA + AMD)
 - **Network Monitoring** — Upload/download speeds with separate colored sparklines (upload extends up, download extends down)
 - **CPU Monitoring** — Overall CPU usage with gradient bar chart and sparkline history
 - **Memory Monitoring** — RAM and swap usage with gradient progress bars
@@ -61,8 +61,9 @@ ktop --version
 
 - Linux (reads `/proc` directly for performance)
 - Python 3.8+
-- NVIDIA GPU + drivers (optional — CPU/memory/network monitoring works without a GPU)
-- Dependencies: `psutil`, `rich`, `pynvml`
+- NVIDIA GPU + drivers (optional — `pynvml` for NVIDIA monitoring)
+- AMD GPU + `amdgpu` driver (optional — uses sysfs, no extra dependencies)
+- Dependencies: `psutil`, `rich`, `pynvml` (optional, for NVIDIA)
 
 ## License
 

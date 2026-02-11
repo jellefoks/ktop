@@ -2,9 +2,10 @@
 """ktop - Terminal system resource monitor for hybrid LLM workloads."""
 from __future__ import annotations
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 
 import argparse
+import glob
 import json
 import os
 import random
@@ -52,6 +53,89 @@ try:
     _PYNVML = True
 except ImportError:
     _PYNVML = False
+
+
+def _detect_amd_gpus() -> list[dict]:
+    """Scan sysfs for AMD GPUs (vendor 0x1002). Returns list of cached card info dicts."""
+    cards = []
+    for vendor_path in sorted(glob.glob("/sys/class/drm/card*/device/vendor")):
+        try:
+            with open(vendor_path) as f:
+                if f.read().strip() != "0x1002":
+                    continue
+        except OSError:
+            continue
+
+        dev_dir = os.path.dirname(vendor_path)  # /sys/class/drm/cardN/device
+
+        # GPU name: try product_name first, fall back to PCI device ID
+        name = "AMD GPU"
+        for name_file in ("product_name", "product_description"):
+            try:
+                with open(os.path.join(dev_dir, name_file)) as f:
+                    n = f.read().strip()
+                    if n:
+                        name = n
+                        break
+            except OSError:
+                continue
+        else:
+            try:
+                with open(os.path.join(dev_dir, "device")) as f:
+                    name = f"AMD GPU [{f.read().strip()}]"
+            except OSError:
+                pass
+
+        # Utilization: gpu_busy_percent (not always available)
+        util_path = os.path.join(dev_dir, "gpu_busy_percent")
+        has_util = os.path.isfile(util_path)
+
+        # VRAM paths
+        vram_total_path = os.path.join(dev_dir, "mem_info_vram_total")
+        vram_used_path = os.path.join(dev_dir, "mem_info_vram_used")
+        has_vram = os.path.isfile(vram_total_path) and os.path.isfile(vram_used_path)
+
+        # Cache static VRAM total
+        vram_total_bytes = 0
+        if has_vram:
+            try:
+                with open(vram_total_path) as f:
+                    vram_total_bytes = int(f.read().strip())
+            except (OSError, ValueError):
+                has_vram = False
+
+        # hwmon temp paths
+        temp_path = None
+        temp_crit_path = None
+        hwmon_dir = os.path.join(dev_dir, "hwmon")
+        if os.path.isdir(hwmon_dir):
+            try:
+                hwmons = os.listdir(hwmon_dir)
+                if hwmons:
+                    hw = os.path.join(hwmon_dir, sorted(hwmons)[0])
+                    t1 = os.path.join(hw, "temp1_input")
+                    if os.path.isfile(t1):
+                        temp_path = t1
+                    tc = os.path.join(hw, "temp1_crit")
+                    if os.path.isfile(tc):
+                        temp_crit_path = tc
+            except OSError:
+                pass
+
+        cards.append({
+            "dev_dir": dev_dir,
+            "name": name,
+            "util_path": util_path,
+            "has_util": has_util,
+            "vram_total_path": vram_total_path,
+            "vram_used_path": vram_used_path,
+            "has_vram": has_vram,
+            "vram_total_bytes": vram_total_bytes,
+            "temp_path": temp_path,
+            "temp_crit_path": temp_crit_path,
+        })
+    return cards
+
 
 # ── constants ────────────────────────────────────────────────────────────────
 SPARK = " ▁▂▃▄▅▆▇█"
@@ -308,21 +392,31 @@ class KTop:
         self._last_net_time = time.monotonic()
 
         # GPU init
-        self.gpu_ok = False
-        self.gpu_count = 0
+        self.nvidia_ok = False
+        self.nvidia_gpu_count = 0
         self.gpu_util_hist: dict[int, deque] = {}
         self.gpu_mem_hist: dict[int, deque] = {}
 
         if _PYNVML:
             try:
                 nvmlInit()
-                self.gpu_count = nvmlDeviceGetCount()
-                self.gpu_ok = True
-                for i in range(self.gpu_count):
+                self.nvidia_gpu_count = nvmlDeviceGetCount()
+                self.nvidia_ok = True
+                for i in range(self.nvidia_gpu_count):
                     self.gpu_util_hist[i] = deque(maxlen=HISTORY_LEN)
                     self.gpu_mem_hist[i] = deque(maxlen=HISTORY_LEN)
             except Exception:
                 pass
+
+        # AMD GPU init (sysfs-based, no dependencies)
+        self._amd_cards = _detect_amd_gpus()
+        for j in range(len(self._amd_cards)):
+            idx = self.nvidia_gpu_count + j
+            self.gpu_util_hist[idx] = deque(maxlen=HISTORY_LEN)
+            self.gpu_mem_hist[idx] = deque(maxlen=HISTORY_LEN)
+
+        self.gpu_count = self.nvidia_gpu_count + len(self._amd_cards)
+        self.gpu_ok = self.gpu_count > 0
 
         # process cache (scanned at most every 5s, read from /proc directly)
         self._procs_by_mem: list[dict] = []
@@ -417,9 +511,9 @@ class KTop:
                             temps["mem_max"] = s.critical
         except (AttributeError, Exception):
             pass
-        # GPU temps + slowdown threshold from pynvml
-        if self.gpu_ok:
-            for i in range(self.gpu_count):
+        # NVIDIA GPU temps + slowdown threshold from pynvml
+        if self.nvidia_ok:
+            for i in range(self.nvidia_gpu_count):
                 try:
                     h = nvmlDeviceGetHandleByIndex(i)
                     t = nvmlDeviceGetTemperature(h, NVML_TEMPERATURE_GPU)
@@ -430,33 +524,93 @@ class KTop:
                     temps["gpus"].append({"temp": t, "max": t_max})
                 except Exception:
                     temps["gpus"].append(None)
+        # AMD GPU temps from hwmon
+        for card in self._amd_cards:
+            if card["temp_path"]:
+                try:
+                    with open(card["temp_path"]) as f:
+                        t = int(f.read().strip()) / 1000  # millidegrees → °C
+                    t_max = 95
+                    if card["temp_crit_path"]:
+                        try:
+                            with open(card["temp_crit_path"]) as f:
+                                t_max = int(f.read().strip()) / 1000
+                        except (OSError, ValueError):
+                            pass
+                    temps["gpus"].append({"temp": t, "max": t_max})
+                except (OSError, ValueError):
+                    temps["gpus"].append(None)
+            else:
+                temps["gpus"].append(None)
         return temps
 
     def _gpu_info(self) -> list[dict]:
         gpus = []
-        if not self.gpu_ok:
-            return gpus
-        for i in range(self.gpu_count):
+        # NVIDIA GPUs
+        if self.nvidia_ok:
+            for i in range(self.nvidia_gpu_count):
+                try:
+                    h = nvmlDeviceGetHandleByIndex(i)
+                    name = nvmlDeviceGetName(h)
+                    if isinstance(name, bytes):
+                        name = name.decode()
+                    util = nvmlDeviceGetUtilizationRates(h)
+                    mem = nvmlDeviceGetMemoryInfo(h)
+                    mem_pct = mem.used / mem.total * 100 if mem.total else 0
+                    self.gpu_util_hist[i].append(util.gpu)
+                    self.gpu_mem_hist[i].append(mem_pct)
+                    gpus.append(
+                        {
+                            "id": i,
+                            "name": name,
+                            "util": util.gpu,
+                            "mem_used_gb": mem.used / 1024**3,
+                            "mem_total_gb": mem.total / 1024**3,
+                            "mem_pct": mem_pct,
+                        }
+                    )
+                except Exception:
+                    pass
+        # AMD GPUs
+        gpus.extend(self._amd_gpu_info())
+        return gpus
+
+    def _amd_gpu_info(self) -> list[dict]:
+        """Read per-frame AMD GPU metrics from cached sysfs paths."""
+        gpus = []
+        for j, card in enumerate(self._amd_cards):
+            idx = self.nvidia_gpu_count + j
             try:
-                h = nvmlDeviceGetHandleByIndex(i)
-                name = nvmlDeviceGetName(h)
-                if isinstance(name, bytes):
-                    name = name.decode()
-                util = nvmlDeviceGetUtilizationRates(h)
-                mem = nvmlDeviceGetMemoryInfo(h)
-                mem_pct = mem.used / mem.total * 100 if mem.total else 0
-                self.gpu_util_hist[i].append(util.gpu)
-                self.gpu_mem_hist[i].append(mem_pct)
-                gpus.append(
-                    {
-                        "id": i,
-                        "name": name,
-                        "util": util.gpu,
-                        "mem_used_gb": mem.used / 1024**3,
-                        "mem_total_gb": mem.total / 1024**3,
-                        "mem_pct": mem_pct,
-                    }
-                )
+                # Utilization
+                util = 0
+                if card["has_util"]:
+                    try:
+                        with open(card["util_path"]) as f:
+                            util = int(f.read().strip())
+                    except (OSError, ValueError):
+                        pass
+
+                # VRAM
+                mem_used = 0
+                mem_total = card["vram_total_bytes"]
+                if card["has_vram"]:
+                    try:
+                        with open(card["vram_used_path"]) as f:
+                            mem_used = int(f.read().strip())
+                    except (OSError, ValueError):
+                        pass
+
+                mem_pct = mem_used / mem_total * 100 if mem_total else 0
+                self.gpu_util_hist[idx].append(util)
+                self.gpu_mem_hist[idx].append(mem_pct)
+                gpus.append({
+                    "id": idx,
+                    "name": card["name"],
+                    "util": util,
+                    "mem_used_gb": mem_used / 1024**3,
+                    "mem_total_gb": mem_total / 1024**3,
+                    "mem_pct": mem_pct,
+                })
             except Exception:
                 pass
         return gpus
@@ -607,7 +761,7 @@ class KTop:
         gpus = self._gpu_info()
         if not gpus:
             return Panel(
-                Text("No GPUs detected (install pynvml for GPU monitoring)", style="dim italic"),
+                Text("No GPUs detected (install pynvml for NVIDIA, or load amdgpu driver for AMD)", style="dim italic"),
                 title=f"[bold {t['gpu']}] GPU [/bold {t['gpu']}]",
                 border_style=t["gpu"],
             )
@@ -632,7 +786,7 @@ class KTop:
                 f"     {g['mem_used_gb']:.1f}/{g['mem_total_gb']:.1f} GB\n"
                 f"     [{mc}]{spark_m}[/{mc}]"
             )
-            name_short = g["name"].replace("NVIDIA ", "").replace(" Generation", "")
+            name_short = g["name"].replace("NVIDIA ", "").replace("AMD ", "").replace("Advanced Micro Devices, Inc. ", "").replace(" Generation", "")
             panel = Panel(
                 Text.from_markup(body),
                 title=f"[bold {t['gpu']}] GPU {g['id']} [/bold {t['gpu']}]",
@@ -1069,7 +1223,7 @@ class KTop:
     # ── run loop ─────────────────────────────────────────────────────────
     def run(self) -> None:
         def _cleanup():
-            if self.gpu_ok:
+            if self.nvidia_ok:
                 try:
                     nvmlShutdown()
                 except Exception:
