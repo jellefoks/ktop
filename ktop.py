@@ -2,6 +2,8 @@
 """ktop - Terminal system resource monitor for hybrid LLM workloads."""
 from __future__ import annotations
 
+__version__ = "0.8.1"
+
 import argparse
 import json
 import os
@@ -1112,6 +1114,9 @@ class KTop:
 # ── CLI ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="ktop — system monitor for hybrid LLM workloads")
+    parser.add_argument(
+        "-v", "--version", action="version", version=f"ktop {__version__}",
+    )
     parser.add_argument(
         "-r", "--refresh", type=float, default=1.0,
         help="Refresh interval in seconds (default: 1.0)",

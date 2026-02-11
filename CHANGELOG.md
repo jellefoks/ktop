@@ -6,6 +6,7 @@
 - Fixed `capture_output=True` + `stderr=DEVNULL` conflict that silently broke OOM detection entirely
 - Uses `short-unix` journal output for reliable timestamp comparison between OOM sources
 - Scope names cleaned up: strips `.scope` suffix and UUIDs for readable display (e.g. `tmux-spawn`)
+- Added `__version__` and `ktop --version` flag
 - Tested: verified both kernel OOM and systemd-oomd kills detected from real journal entries, reinstalled via setup.sh
 
 ## 0.8.0 — 2026-02-10
