@@ -13,7 +13,7 @@ A terminal-based system resource monitor built for tracking resource usage when 
 - **CPU Monitoring** — Overall CPU usage with gradient bar chart and sparkline history
 - **Memory Monitoring** — RAM and swap usage with gradient progress bars
 - **Temperature Strip** — CPU, memory, and per-GPU temps with mini bar charts and hardware-accurate thresholds
-- **OOM Kill Tracker** — Status bar shows the most recent OOM kill from the last 8 hours
+- **OOM Kill Tracker** — Status bar shows the most recent OOM kill from the last 8 hours (kernel OOM and systemd-oomd)
 - **Process Tables** — Top 10 processes by memory (Used/Shared) and CPU usage (Core % + system-wide CPU %)
 - **50 Color Themes** — Press `t` to browse and switch themes with live preview; persists across sessions
 - **Gradient Bar Charts** — Smooth per-block color gradients from low to high across all bars
@@ -43,6 +43,9 @@ ktop --theme "Tokyo Night"
 
 # Simulation mode (fake OOM kills, profiling to /tmp/ktop_profile.log)
 ktop --sim
+
+# Show version
+ktop --version
 ```
 
 ### Keybindings
