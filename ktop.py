@@ -292,9 +292,40 @@ def _sparkline(values, width: int | None = None) -> str:
     out = []
     for v in vals:
         v = max(0.0, min(100.0, v))
-        idx = int(v / 100 * (len(SPARK) - 1))
+        if v <= 5.0:
+            idx = 0  # space for ≤5%
+        else:
+            # Map 5–100% onto indices 1–8
+            idx = 1 + int((v - 5.0) / 95.0 * (len(SPARK) - 2))
+            idx = min(idx, len(SPARK) - 1)
         out.append(SPARK[idx])
     return "".join(out)
+
+
+def _sparkline_double(values, width: int | None = None) -> tuple[str, str]:
+    """Double-height sparkline: returns (top_row, bottom_row) with 16 levels."""
+    if not values:
+        return "", ""
+    vals = list(values)
+    if width and len(vals) > width:
+        vals = vals[-width:]
+    n = len(SPARK) - 1  # 8 levels per row
+    top = []
+    bot = []
+    for v in vals:
+        v = max(0.0, min(100.0, v))
+        # Map to 0–16 (2*n) levels
+        level = int(v / 100 * (2 * n))
+        level = min(level, 2 * n)
+        if level <= n:
+            # Bottom row only
+            top.append(SPARK[0])
+            bot.append(SPARK[level])
+        else:
+            # Bottom full, top gets the overflow
+            bot.append(SPARK[n])
+            top.append(SPARK[level - n])
+    return "".join(top), "".join(bot)
 
 
 def _sparkline_down(values, width: int | None = None) -> str:
@@ -826,11 +857,11 @@ class KTop:
         # "Overall  " = 9 chars, " XX.X%" = 7 chars (space + 5-wide float + %)
         bar_w = max(5, panel_w - 9 - 7)
         spark_w = max(10, panel_w - 9)
-        spark = _sparkline(self.cpu_hist, width=spark_w)
+        spark_top, spark_bot = _sparkline_double(self.cpu_hist, width=spark_w)
         body = (
             f"[bold]Overall[/bold]  {_bar(pct, bar_w, t)} [{c}]{pct:5.1f}%[/{c}]\n"
             f"[dim]Cores: {self._cpu_cores}  Freq: {self._cpu_freq_str}[/dim]\n\n"
-            f"[bold]History[/bold]\n         [{c}]{spark}[/{c}]"
+            f"[bold]History[/bold]\n         [{c}]{spark_top}[/{c}]\n         [{c}]{spark_bot}[/{c}]"
         )
         return Panel(
             Text.from_markup(body),
