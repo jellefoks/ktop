@@ -40,6 +40,8 @@ with warnings.catch_warnings():
         from pynvml import (
             NVML_TEMPERATURE_GPU,
             NVML_TEMPERATURE_THRESHOLD_SLOWDOWN,
+            NVML_PCIE_UTIL_TX_BYTES,
+            NVML_PCIE_UTIL_RX_BYTES,
             nvmlDeviceGetCount,
             nvmlDeviceGetHandleByIndex,
             nvmlDeviceGetMemoryInfo,
@@ -47,6 +49,9 @@ with warnings.catch_warnings():
             nvmlDeviceGetTemperature,
             nvmlDeviceGetTemperatureThreshold,
             nvmlDeviceGetUtilizationRates,
+            nvmlDeviceGetCurrPcieLinkGeneration,
+            nvmlDeviceGetCurrPcieLinkWidth,
+            nvmlDeviceGetPcieThroughput,
             nvmlInit,
             nvmlShutdown,
         )
@@ -151,6 +156,26 @@ SPARK_DOWN = " ▔\U0001FB82\U0001FB83▀\U0001FB84\U0001FB85\U0001FB86█"
 HISTORY_LEN = 300
 CONFIG_DIR = Path.home() / ".config" / "ktop"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+
+# PCIe theoretical max bandwidth per lane in KB/s (base 1000)
+# Formulas: (GT/s * EncodingEfficiency) / 8 bits_per_byte * 10^6 KB_per_GB
+PCIE_LANE_BW = {
+    1: int((2.5 * 0.80) / 8 * 1000 * 1000),      # 0.250 GB/s
+    2: int((5.0 * 0.80) / 8 * 1000 * 1000),      # 0.500 GB/s
+    3: int((8.0 * 128/130) / 8 * 1000 * 1000),   # 0.985 GB/s
+    4: int((16.0 * 128/130) / 8 * 1000 * 1000),  # 1.969 GB/s
+    5: int((32.0 * 128/130) / 8 * 1000 * 1000),  # 3.938 GB/s
+    6: int((64.0 * 242/256) / 8 * 1000 * 1000),  # 7.563 GB/s
+    7: int((128.0 * 242/256) / 8 * 1000 * 1000), # 15.125 GB/s
+}
+
+
+def _short_spd(b: float) -> str:
+    if b >= 1000**3: return f"{b/1000**3:.1f}G"
+    if b >= 1000**2: return f"{b/1000**2:.1f}M"
+    if b >= 1000: return f"{b/1000:.0f}K"
+    return f"{b:.0f}B"
+
 
 # ── themes ───────────────────────────────────────────────────────────────────
 # Each theme: (gpu, cpu, mem, proc_mem, proc_cpu, bar_low, bar_mid, bar_high)
@@ -276,6 +301,25 @@ def _bar(pct: float, width: int = 25, theme: dict | None = None) -> str:
     return "".join(parts)
 
 
+def _simplex_bar(rx_pct: float, tx_pct: float, width: int = 25, theme: dict | None = None) -> str:
+    """Render a dual-ended bar: RX from left, TX from right."""
+    w_rx = int(min(rx_pct, 100.0) / 100 * width)
+    w_tx = int(min(tx_pct, 100.0) / 100 * width)
+
+    # If they overlap, scale them down proportionally to fit the total width
+    if w_rx + w_tx > width and width > 0:
+        total = w_rx + w_tx
+        w_rx = int(w_rx / total * width)
+        w_tx = width - w_rx
+
+    w_idle = width - w_rx - w_tx
+
+    c_rx = theme["net_down"] if theme else "cyan"
+    c_tx = theme["net_up"] if theme else "magenta"
+
+    return f"[{c_rx}]{'█' * w_rx}[/{c_rx}][dim]{'░' * w_idle}[/dim][{c_tx}]{'█' * w_tx}[/{c_tx}]"
+
+
 def _color_for(pct: float, theme: dict | None = None) -> str:
     if theme:
         if pct < 50:
@@ -348,6 +392,14 @@ def _sparkline_down(values, width: int | None = None) -> str:
         idx = int(v / 100 * (len(SPARK_DOWN) - 1))
         out.append(SPARK_DOWN[idx])
     return "".join(out)
+
+
+def _fmt_pcie_pair(rx_b, tx_b) -> tuple[str, str, str]:
+    """Format RX/TX pair with synchronized unit and fixed width (base 1000)."""
+    mx = max(rx_b, tx_b)
+    if mx >= 1000**3:
+        return f"{rx_b/1000**3:6.1f}", f"{tx_b/1000**3:6.1f}", "GB/s"
+    return f"{rx_b/1000**2:6.1f}", f"{tx_b/1000**2:6.1f}", "MB/s"
 
 
 def _fmt_bytes(b: float) -> str:
@@ -435,6 +487,8 @@ class KTop:
         self.nvidia_gpu_count = 0
         self.gpu_util_hist: dict[int, deque] = {}
         self.gpu_mem_hist: dict[int, deque] = {}
+        self.gpu_pcie_tx_hist: dict[int, deque] = {}
+        self.gpu_pcie_rx_hist: dict[int, deque] = {}
 
         if _PYNVML:
             try:
@@ -444,6 +498,8 @@ class KTop:
                 for i in range(self.nvidia_gpu_count):
                     self.gpu_util_hist[i] = deque(maxlen=HISTORY_LEN)
                     self.gpu_mem_hist[i] = deque(maxlen=HISTORY_LEN)
+                    self.gpu_pcie_tx_hist[i] = deque(maxlen=HISTORY_LEN)
+                    self.gpu_pcie_rx_hist[i] = deque(maxlen=HISTORY_LEN)
             except Exception:
                 pass
 
@@ -453,6 +509,8 @@ class KTop:
             idx = self.nvidia_gpu_count + j
             self.gpu_util_hist[idx] = deque(maxlen=HISTORY_LEN)
             self.gpu_mem_hist[idx] = deque(maxlen=HISTORY_LEN)
+            self.gpu_pcie_tx_hist[idx] = deque(maxlen=HISTORY_LEN)
+            self.gpu_pcie_rx_hist[idx] = deque(maxlen=HISTORY_LEN)
 
         self.gpu_count = self.nvidia_gpu_count + len(self._amd_cards)
         self.gpu_ok = self.gpu_count > 0
@@ -598,6 +656,23 @@ class KTop:
                     mem_pct = mem.used / mem.total * 100 if mem.total else 0
                     self.gpu_util_hist[i].append(util.gpu)
                     self.gpu_mem_hist[i].append(mem_pct)
+
+                    # PCIe info
+                    try:
+                        pcie_gen = nvmlDeviceGetCurrPcieLinkGeneration(h)
+                        pcie_width = nvmlDeviceGetCurrPcieLinkWidth(h)
+                        pcie_tx = nvmlDeviceGetPcieThroughput(h, NVML_PCIE_UTIL_TX_BYTES)
+                        pcie_rx = nvmlDeviceGetPcieThroughput(h, NVML_PCIE_UTIL_RX_BYTES)
+
+                        max_bw = PCIE_LANE_BW.get(pcie_gen, 250 * 1000) * pcie_width
+                        tx_pct = (pcie_tx / max_bw) * 100 if max_bw else 0
+                        rx_pct = (pcie_rx / max_bw) * 100 if max_bw else 0
+                    except Exception:
+                        pcie_gen = pcie_width = pcie_tx = pcie_rx = tx_pct = rx_pct = 0
+
+                    self.gpu_pcie_tx_hist[i].append(tx_pct)
+                    self.gpu_pcie_rx_hist[i].append(rx_pct)
+
                     gpus.append(
                         {
                             "id": i,
@@ -606,6 +681,12 @@ class KTop:
                             "mem_used_gb": mem.used / 1024**3,
                             "mem_total_gb": mem.total / 1024**3,
                             "mem_pct": mem_pct,
+                            "pcie_gen": pcie_gen,
+                            "pcie_width": pcie_width,
+                            "pcie_tx": pcie_tx,
+                            "pcie_rx": pcie_rx,
+                            "pcie_tx_pct": tx_pct,
+                            "pcie_rx_pct": rx_pct,
                         }
                     )
                 except Exception:
@@ -642,6 +723,10 @@ class KTop:
                 mem_pct = mem_used / mem_total * 100 if mem_total else 0
                 self.gpu_util_hist[idx].append(util)
                 self.gpu_mem_hist[idx].append(mem_pct)
+                # AMD PCIe history placeholder
+                self.gpu_pcie_tx_hist[idx].append(0)
+                self.gpu_pcie_rx_hist[idx].append(0)
+
                 gpus.append({
                     "id": idx,
                     "name": card["name"],
@@ -649,6 +734,12 @@ class KTop:
                     "mem_used_gb": mem_used / 1024**3,
                     "mem_total_gb": mem_total / 1024**3,
                     "mem_pct": mem_pct,
+                    "pcie_gen": 0,
+                    "pcie_width": 0,
+                    "pcie_tx": 0,
+                    "pcie_rx": 0,
+                    "pcie_tx_pct": 0,
+                    "pcie_rx_pct": 0,
                 })
             except Exception:
                 pass
@@ -817,14 +908,36 @@ class KTop:
             mc = _color_for(g["mem_pct"], t)
             spark_u = _sparkline(self.gpu_util_hist[g["id"]], width=spark_w)
             spark_m = _sparkline(self.gpu_mem_hist[g["id"]], width=spark_w)
+
             body = (
                 f"[bold]Util[/bold] {_bar(g['util'], bar_w, t)} [{uc}]{g['util']:5.1f}%[/{uc}]\n"
                 f"     [{uc}]{spark_u}[/{uc}]\n"
-                f"\n"
                 f"[bold]Mem [/bold] {_bar(g['mem_pct'], bar_w, t)} [{mc}]{g['mem_pct']:5.1f}%[/{mc}]\n"
                 f"     {g['mem_used_gb']:.1f}/{g['mem_total_gb']:.1f} GB\n"
-                f"     [{mc}]{spark_m}[/{mc}]"
+                f"     [{mc}]{spark_m}[/{mc}]\n"
             )
+
+            if g.get("pcie_gen"):
+                tx_pct = g["pcie_tx_pct"]
+                rx_pct = g["pcie_rx_pct"]
+                # Fixed colors for RX/TX to match Bus bar
+                c_rx = t["net_down"]
+                c_tx = t["net_up"]
+                spark_rx = _sparkline(self.gpu_pcie_rx_hist[g["id"]], width=spark_w)
+                spark_tx_down = _sparkline_down(self.gpu_pcie_tx_hist[g["id"]], width=spark_w)
+
+                # Use * 1000 to be consistent with base 1000 requested
+                rx_val, tx_val, unit = _fmt_pcie_pair(g["pcie_rx"] * 1000, g["pcie_tx"] * 1000)
+
+                simplex_w = spark_w
+                simplex = _simplex_bar(rx_pct, tx_pct, simplex_w, t)
+
+                body += (
+                    f"[dim]PCIe{g['pcie_gen']}x{g['pcie_width']}[/dim] R:{rx_val} T:{tx_val} {unit}\n"
+                    f"[bold]Bus  [/bold]{simplex}\n"
+                    f"     [{c_rx}]{spark_rx}[/{c_rx}]\n"
+                    f"     [{c_tx}]{spark_tx_down}[/{c_tx}]"
+                )
             name_short = g["name"].replace("NVIDIA ", "").replace("AMD ", "").replace("Advanced Micro Devices, Inc. ", "").replace(" Generation", "")
             panel = Panel(
                 Text.from_markup(body),
@@ -1197,7 +1310,7 @@ class KTop:
 
         layout = Layout()
         layout.split_column(
-            Layout(name="gpu", ratio=2),
+            Layout(name="gpu", ratio=4),
             Layout(name="mid", ratio=2),
             Layout(name="temps", size=3),
             Layout(name="bot", ratio=3),
