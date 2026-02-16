@@ -48,6 +48,9 @@ with warnings.catch_warnings():
             nvmlDeviceGetName,
             nvmlDeviceGetTemperature,
             nvmlDeviceGetTemperatureThreshold,
+            nvmlDeviceGetPowerUsage,
+            nvmlDeviceGetEnforcedPowerLimit,
+            nvmlDeviceGetPowerManagementLimit,
             nvmlDeviceGetUtilizationRates,
             nvmlDeviceGetCurrPcieLinkGeneration,
             nvmlDeviceGetCurrPcieLinkWidth,
@@ -117,21 +120,33 @@ def _detect_amd_gpus() -> list[dict]:
             except (OSError, ValueError):
                 has_vram = False
 
-        # hwmon temp paths
+        # hwmon paths
         temp_path = None
         temp_crit_path = None
+        power_path = None
+        power_cap_path = None
         hwmon_dir = os.path.join(dev_dir, "hwmon")
         if os.path.isdir(hwmon_dir):
             try:
                 hwmons = os.listdir(hwmon_dir)
                 if hwmons:
                     hw = os.path.join(hwmon_dir, sorted(hwmons)[0])
+                    # Temp
                     t1 = os.path.join(hw, "temp1_input")
                     if os.path.isfile(t1):
                         temp_path = t1
                     tc = os.path.join(hw, "temp1_crit")
                     if os.path.isfile(tc):
                         temp_crit_path = tc
+                    # Power
+                    for p_file in ("power1_average", "power1_input"):
+                        p_path = os.path.join(hw, p_file)
+                        if os.path.isfile(p_path):
+                            power_path = p_path
+                            break
+                    pc = os.path.join(hw, "power1_cap")
+                    if os.path.isfile(pc):
+                        power_cap_path = pc
             except OSError:
                 pass
 
@@ -146,6 +161,8 @@ def _detect_amd_gpus() -> list[dict]:
             "vram_total_bytes": vram_total_bytes,
             "temp_path": temp_path,
             "temp_crit_path": temp_crit_path,
+            "power_path": power_path,
+            "power_cap_path": power_cap_path,
         })
     return cards
 
@@ -397,9 +414,16 @@ def _sparkline_down(values, width: int | None = None) -> str:
 def _fmt_pcie_pair(rx_b, tx_b) -> tuple[str, str, str]:
     """Format RX/TX pair with synchronized unit and fixed width (base 1000)."""
     mx = max(rx_b, tx_b)
-    if mx >= 1000**3:
-        return f"{rx_b/1000**3:6.1f}", f"{tx_b/1000**3:6.1f}", "GB/s"
-    return f"{rx_b/1000**2:6.1f}", f"{tx_b/1000**2:6.1f}", "MB/s"
+    unit = "GB/s" if mx >= 1000**3 else "MB/s"
+    div = 1000**3 if mx >= 1000**3 else 1000**2
+
+    def fmt(v):
+        val = v / div
+        if val >= 100:
+            return f"{val:4.0f}"
+        return f"{val:4.1f}"
+
+    return fmt(rx_b), fmt(tx_b), unit
 
 
 def _fmt_bytes(b: float) -> str:
@@ -489,6 +513,8 @@ class KTop:
         self.gpu_mem_hist: dict[int, deque] = {}
         self.gpu_pcie_tx_hist: dict[int, deque] = {}
         self.gpu_pcie_rx_hist: dict[int, deque] = {}
+        self.gpu_power_hist: dict[int, deque] = {}
+        self.gpu_temp_hist: dict[int, deque] = {}
 
         if _PYNVML:
             try:
@@ -500,6 +526,8 @@ class KTop:
                     self.gpu_mem_hist[i] = deque(maxlen=HISTORY_LEN)
                     self.gpu_pcie_tx_hist[i] = deque(maxlen=HISTORY_LEN)
                     self.gpu_pcie_rx_hist[i] = deque(maxlen=HISTORY_LEN)
+                    self.gpu_power_hist[i] = deque(maxlen=HISTORY_LEN)
+                    self.gpu_temp_hist[i] = deque(maxlen=HISTORY_LEN)
             except Exception:
                 pass
 
@@ -511,6 +539,8 @@ class KTop:
             self.gpu_mem_hist[idx] = deque(maxlen=HISTORY_LEN)
             self.gpu_pcie_tx_hist[idx] = deque(maxlen=HISTORY_LEN)
             self.gpu_pcie_rx_hist[idx] = deque(maxlen=HISTORY_LEN)
+            self.gpu_power_hist[idx] = deque(maxlen=HISTORY_LEN)
+            self.gpu_temp_hist[idx] = deque(maxlen=HISTORY_LEN)
 
         self.gpu_count = self.nvidia_gpu_count + len(self._amd_cards)
         self.gpu_ok = self.gpu_count > 0
@@ -657,6 +687,36 @@ class KTop:
                     self.gpu_util_hist[i].append(util.gpu)
                     self.gpu_mem_hist[i].append(mem_pct)
 
+                    # Power & Temp
+                    try:
+                        temp = nvmlDeviceGetTemperature(h, NVML_TEMPERATURE_GPU)
+                        try:
+                            temp_limit = nvmlDeviceGetTemperatureThreshold(h, NVML_TEMPERATURE_THRESHOLD_SLOWDOWN)
+                        except Exception:
+                            temp_limit = 90
+                        temp_pct = max(0, (temp - 30) / (temp_limit - 30) * 100) if temp_limit > 30 else 0
+                    except Exception:
+                        temp = temp_limit = temp_pct = 0
+
+                    try:
+                        power_mw = nvmlDeviceGetPowerUsage(h)
+                        power_w = power_mw / 1000.0
+                        try:
+                            power_limit_mw = nvmlDeviceGetEnforcedPowerLimit(h)
+                            power_limit_w = power_limit_mw / 1000.0
+                        except Exception:
+                            try:
+                                power_limit_mw = nvmlDeviceGetPowerManagementLimit(h)
+                                power_limit_w = power_limit_mw / 1000.0
+                            except Exception:
+                                power_limit_w = 250.0
+                        power_pct = (power_w / power_limit_w) * 100 if power_limit_w else 0
+                    except Exception:
+                        power_w = power_limit_w = power_pct = 0
+
+                    self.gpu_power_hist[i].append(power_pct)
+                    self.gpu_temp_hist[i].append(temp_pct)
+
                     # PCIe info
                     try:
                         pcie_gen = nvmlDeviceGetCurrPcieLinkGeneration(h)
@@ -687,6 +747,12 @@ class KTop:
                             "pcie_rx": pcie_rx,
                             "pcie_tx_pct": tx_pct,
                             "pcie_rx_pct": rx_pct,
+                            "power_w": power_w,
+                            "power_limit_w": power_limit_w,
+                            "power_pct": power_pct,
+                            "temp": temp,
+                            "temp_limit": temp_limit,
+                            "temp_pct": temp_pct,
                         }
                     )
                 except Exception:
@@ -723,6 +789,41 @@ class KTop:
                 mem_pct = mem_used / mem_total * 100 if mem_total else 0
                 self.gpu_util_hist[idx].append(util)
                 self.gpu_mem_hist[idx].append(mem_pct)
+
+                # Temp
+                temp = 0
+                temp_limit = 95
+                temp_pct = 0
+                if card["temp_path"]:
+                    try:
+                        with open(card["temp_path"]) as f:
+                            temp = int(f.read().strip()) / 1000
+                        if card["temp_crit_path"]:
+                            try:
+                                with open(card["temp_crit_path"]) as f:
+                                    temp_limit = int(f.read().strip()) / 1000
+                            except (OSError, ValueError): pass
+                        temp_pct = max(0, (temp - 30) / (temp_limit - 30) * 100) if temp_limit > 30 else 0
+                    except (OSError, ValueError): pass
+                self.gpu_temp_hist[idx].append(temp_pct)
+
+                # Power
+                power_w = 0
+                power_limit_w = 250
+                power_pct = 0
+                if card["power_path"]:
+                    try:
+                        with open(card["power_path"]) as f:
+                            power_w = int(f.read().strip()) / 1_000_000 # microwatts → watts
+                        if card["power_cap_path"]:
+                            try:
+                                with open(card["power_cap_path"]) as f:
+                                    power_limit_w = int(f.read().strip()) / 1_000_000
+                            except (OSError, ValueError): pass
+                        power_pct = (power_w / power_limit_w) * 100 if power_limit_w else 0
+                    except (OSError, ValueError): pass
+                self.gpu_power_hist[idx].append(power_pct)
+
                 # AMD PCIe history placeholder
                 self.gpu_pcie_tx_hist[idx].append(0)
                 self.gpu_pcie_rx_hist[idx].append(0)
@@ -740,6 +841,12 @@ class KTop:
                     "pcie_rx": 0,
                     "pcie_tx_pct": 0,
                     "pcie_rx_pct": 0,
+                    "power_w": power_w,
+                    "power_limit_w": power_limit_w,
+                    "power_pct": power_pct,
+                    "temp": temp,
+                    "temp_limit": temp_limit,
+                    "temp_pct": temp_pct,
                 })
             except Exception:
                 pass
@@ -899,22 +1006,28 @@ class KTop:
         gpu_layout = Layout()
         # Panel inner width: total / num_gpus, minus border(2) + padding(2) + safety(2)
         panel_w = max(20, self.console.width // max(len(gpus), 1) - 6)
-        # "Util " / "Mem  " = 5 chars, " XX.X%" = 7 chars
-        bar_w = max(5, panel_w - 5 - 7)
+        # label(5) + space(1) + value(5/6) + unit(1/2) = 12
+        bar_w = max(5, panel_w - 12)
         spark_w = max(10, panel_w - 5)
         children = []
         for g in gpus:
             uc = _color_for(g["util"], t)
             mc = _color_for(g["mem_pct"], t)
+            pc = _color_for(g["power_pct"], t)
+            tc = _color_for(g["temp_pct"], t)
             spark_u = _sparkline(self.gpu_util_hist[g["id"]], width=spark_w)
             spark_m = _sparkline(self.gpu_mem_hist[g["id"]], width=spark_w)
+            spark_p = _sparkline(self.gpu_power_hist[g["id"]], width=spark_w)
+            spark_t = _sparkline(self.gpu_temp_hist[g["id"]], width=spark_w)
 
             body = (
-                f"[bold]Util[/bold] {_bar(g['util'], bar_w, t)} [{uc}]{g['util']:5.1f}%[/{uc}]\n"
+                f"[bold]Util[/bold] {_bar(g['util'], bar_w, t)} [{uc}]{g['util']:4.0f}%[/{uc}]\n"
                 f"     [{uc}]{spark_u}[/{uc}]\n"
-                f"[bold]Mem [/bold] {_bar(g['mem_pct'], bar_w, t)} [{mc}]{g['mem_pct']:5.1f}%[/{mc}]\n"
+                f"[bold]Mem [/bold] {_bar(g['mem_pct'], bar_w, t)} [{mc}]{g['mem_pct']:4.0f}%[/{mc}]\n"
                 f"     {g['mem_used_gb']:.1f}/{g['mem_total_gb']:.1f} GB\n"
                 f"     [{mc}]{spark_m}[/{mc}]\n"
+                f"[bold]Pwr [/bold] {_bar(g['power_pct'], bar_w, t)} [{pc}]{g['power_w']:4.0f}W[/{pc}]\n"
+                f"     [{pc}]{spark_p}[/{pc}]\n"
             )
 
             if g.get("pcie_gen"):
@@ -933,7 +1046,7 @@ class KTop:
                 simplex = _simplex_bar(rx_pct, tx_pct, simplex_w, t)
 
                 body += (
-                    f"[dim]PCIe{g['pcie_gen']}x{g['pcie_width']}[/dim] R:{rx_val} T:{tx_val} {unit}\n"
+                    f"[dim]PCIe{g['pcie_gen']}x{g['pcie_width']}[/dim] R/T {rx_val} / {tx_val} {unit}\n"
                     f"[bold]Bus  [/bold]{simplex}\n"
                     f"     [{c_rx}]{spark_rx}[/{c_rx}]\n"
                     f"     [{c_tx}]{spark_tx_down}[/{c_tx}]"
